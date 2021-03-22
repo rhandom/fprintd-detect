@@ -223,13 +223,7 @@ sub start_reader {
             $fprint_sig{'VerifyStatus'} = $fprint_obj->connect_to_signal(VerifyStatus => \&verify_status);
         }
 
-        my $fnames = $fprint_obj->ListEnrolledFingers(user()) || [];
-        if (! @$fnames) {
-            _log("No fingerprints found - not starting reader");
-            return;
-        }
-        eval { $fprint_obj->VerifyStart($fnames->[0]); 1 } ? _log("VerifyStart $fnames->[0]") : _log("Failed VerifyStart: $@");
-
+        eval { $fprint_obj->VerifyStart('any'); 1 } ? _log("VerifyStart any") : _log("Failed VerifyStart: $@");
     }
 
     # non-dbus forking method
