@@ -1,0 +1,282 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+fprintd-detect - use dbus and fprintd to allow for fingerprint based screenunlock
+
+=head1 SYNOPSIS
+
+    fprintd-detect
+
+    --log-file --log_file log -o [filename]
+
+    --test-start
+
+=cut
+
+use strict;
+use warnings;
+
+use Net::DBus;
+use Net::DBus::Reactor;
+use Getopt::Long qw(GetOptions);
+
+my $fprint_pid;
+my $fprint_obj;
+my %fprint_sig;
+my $is_suspend;
+my $use_dbus;
+our $log_file;
+
+main();
+
+sub main {
+    local $| = 1;
+    my %opts;
+    GetOptions(\%opts, qw(log_file|log-file|log|o=s test_start|test-start help|h|?)) || $opts{'help'}++;
+    if ($opts{'help'}) {
+        require Pod::Usage;
+        Pod::Usage::pod2usage({
+            -input   => __FILE__,
+            -verbose => 99,
+            -exitval => 1,
+        });
+    }
+    $log_file = $opts{'log_file'};
+
+
+    check_fprint_setup();
+
+    my $bus     = Net::DBus->session();
+    my $service = $bus->get_service('org.freedesktop.ScreenSaver');
+    my $object  = $service->get_object('/org/freedesktop/ScreenSaver', 'org.freedesktop.ScreenSaver');
+    my $sig     = $object->connect_to_signal(ActiveChanged => \&active_changed);
+
+    my $serv2   = $bus->get_service('org.kde.Solid.PowerManagement');
+    my $obj2    = $serv2->get_object('/org/kde/Solid/PowerManagement/Actions/SuspendSession', 'org.kde.Solid.PowerManagement.Actions.SuspendSession');
+    my $sig2    = $obj2->connect_to_signal(aboutToSuspend => \&about_to_suspend);
+    my $sig3    = $obj2->connect_to_signal(resumingFromSuspend => \&resuming_from_suspend);
+
+    my $reactor = Net::DBus::Reactor->main();
+
+    local $SIG{'INT'} = local $SIG{'TERM'} = sub {
+        _log("Stopping via SIG".shift());
+        $SIG{'INT'} = $SIG{'TERM'} = 'default';
+        stop_reader();
+        _log("Calling exit");
+        exit(0);
+    };
+
+    _log("Waiting for screen-lock");
+
+    if ($opts{'test_start'}) {
+        _log("Starting reader via --test-start");
+        my $key;
+        $key = $reactor->add_timeout(1, sub { $reactor->remove_timeout($key); start_reader() });
+    }
+
+    $reactor->run();
+}
+
+sub unlock {
+    my $service = Net::DBus->system()->get_service("org.freedesktop.login1");
+    my $object  = $service->get_object("/org/freedesktop/login1/session/self", "org.freedesktop.login1.Session");
+    $object->Unlock();
+    # qdbus --system org.freedesktop.login1 /org/freedesktop/login1/session/self org.freedesktop.login1.Session.Unlock
+    # There is also loginctl unlock-sessions - but that requires root privileges
+}
+
+sub _log {
+    my $msg = shift;
+    chomp $msg;
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
+    $msg = sprintf "[%4d-%02d-%02d %02d:%02d:%02d] ($$) %s\n", $year+1900, $mon+1, $day, $hour, $min, $sec, $msg;
+    if ($log_file) {
+        open my $fh, ">>", $log_file or die "Failed to open $log_file: $!";
+        print $fh $msg;
+    } else {
+        print $msg;
+    }
+    return $msg;
+}
+
+sub user { return scalar getpwuid $< }
+
+sub check_fprint_setup {
+    my $user = user();
+
+    my ($s, $dev);
+    eval {
+        $s = Net::DBus->system()->get_service('net.reactivated.Fprint');
+        my $o = $s->get_object('/net/reactivated/Fprint/Manager', 'net.reactivated.Fprint.Manager');
+        $dev = $o->GetDefaultDevice;
+    };
+
+    if ($dev) {
+        $s ||= Net::DBus->system()->get_service('net.reactivated.Fprint');
+        my $o = $s->get_object($dev, 'net.reactivated.Fprint.Device');
+        my $fingers = $o->ListEnrolledFingers($user) || [];
+        _log("No enrolled fingers for fprint $dev") if ! @$fingers;
+        _log("Using dbus $dev (@$fingers)");
+        $use_dbus = 1;
+        return;
+    }
+
+
+    die _log("Did not find fprintd-verify") if ! -x '/usr/bin/fprintd-verify';
+    open my $fh, '-|', '/usr/bin/fprintd-list', $user or die _log("Could not open fprintd-list: $!");
+    my $out = join '', <$fh>;
+#found 1 devices
+#Device at /net/reactivated/Fprint/Device/0
+#Using device /net/reactivated/Fprint/Device/0
+#Fingerprints for user paul on Goodix Fingerprint Sensor 53xc (press):
+#    - #0: right-index-finger
+    die _log("No fprint devices found -- cannot unlock") if $out !~ /found \d+ devices/;
+    die _log("No enrolled fingerprints found") if $out !~ /^\s+-\s+#\d+: /m;
+    return 1;
+}
+
+###----------------------------------------------------------------###
+
+sub active_changed {
+    my $active = shift;
+    if ($active) {
+        if ($is_suspend) {
+            _log("ScreenSaver activated during suspend");
+            return;
+        }
+        _log("-"x12);
+        _log("ScreenSaver activated");
+        start_reader();
+    } else {
+        _log("ScreenSaver deactivated");
+        stop_reader();
+    }
+}
+
+sub about_to_suspend {
+    _log("<"x12);
+    _log("About to suspend");
+    $is_suspend = 1;
+}
+
+sub resuming_from_suspend {
+    $is_suspend = 0;
+    _log(">"x12);
+    _log("Resuming from suspend");
+    stop_reader();
+    sleep 1;
+    start_reader();
+}
+
+sub verify_status {
+    my ($result, $done) = @_;
+    return if ! $fprint_obj;
+    _log("Status: $result ".($done ? '(done)' : '(not-done)'));
+    return if ! $done;
+
+    eval { $fprint_obj->VerifyStop(); 1 } && _log("VerifyStop");
+    #stop_reader(); # this is more brute force than is necessary and results in a larger gap in signal reading
+    unlock() if $result eq 'verify-match';
+    start_reader();
+}
+
+###----------------------------------------------------------------###
+
+sub stop_reader {
+    if ($use_dbus) {
+        return if ! $fprint_obj;
+        local $SIG{'ALRM'} = sub { _log("Timeout stopping"); exit(1) };
+        eval { $fprint_obj->disconnect_from_signal($_, delete($fprint_sig{$_})); 1 } || _log("Failed signal disconnect: $@") for keys %fprint_sig;
+        eval { $fprint_obj->Release(); 1 } ? _log("released claim") : _log("failed to release claim: $@");
+        alarm(0);
+        $fprint_obj = undef;
+
+    }
+
+    # non-dbus forking method
+    else {
+        return if ! $fprint_pid;
+        for (1..10) {
+            kill 2, $fprint_pid; # INT
+            1 while waitpid(-1, POSIX::WNOHANG()) > 0;
+            last if ! kill 0, $fprint_pid;
+            select undef, undef, undef, .1;
+        }
+        kill 0, $fprint_pid and die _log("Found the fprint pid still running after attempted stop");
+        $fprint_pid = undef;
+        _log("Terminated child fprintd-verify watcher");
+    }
+}
+
+sub start_reader {
+    if ($use_dbus) {
+        if (! $fprint_obj) {
+            my $sys = Net::DBus->system()->get_service('net.reactivated.Fprint');
+            my $obj = $sys->get_object('/net/reactivated/Fprint/Manager', 'net.reactivated.Fprint.Manager');
+            my $dev = $obj->GetDefaultDevice || die "Could not find default fprint device\n";
+
+            my $user = user();
+            $fprint_obj = $sys->get_object($dev, 'net.reactivated.Fprint.Device');
+
+            $fprint_obj->Claim($user);
+            $fprint_sig{'VerifyStatus'} = $fprint_obj->connect_to_signal(VerifyStatus => \&verify_status);
+        }
+
+        my $fnames = $fprint_obj->ListEnrolledFingers(user()) || [];
+        if (! @$fnames) {
+            _log("No fingerprints found - not starting reader");
+            return;
+        }
+        eval { $fprint_obj->VerifyStart($fnames->[0]); 1 } ? _log("VerifyStart $fnames->[0]") : _log("Failed VerifyStart: $@");
+
+    }
+
+    # non-dbus forking method
+    else {
+        require POSIX;
+        if ($fprint_pid) {
+            _log("fprint already active");
+            return;
+        }
+        $fprint_pid = fork // die _log("Could not fork fprint reader: $!");
+        if ($fprint_pid) {
+            _log("Started child fprintd-verify watcher");
+            return;
+        }
+
+        # child
+
+        my $pid;
+        local $SIG{'INT'} = local $SIG{'TERM'} = sub {
+            kill 2, $pid; # int
+            POSIX::_exit(1);
+        };
+        while (1) {
+            _log("child - Calling fprintd-verify");
+            $pid = open my $fh, '-|', '/usr/bin/fprintd-verify' or do {
+                _log("child - Could not open fprintd-verify: $!");
+                POSIX::_exit(1);
+            };
+            my $out = join '', <$fh>;
+            close $fh;
+            $pid = undef;
+            if ($out !~ /\QVerify result: verify-match (done)\E/) {
+                if ($out =~ /\QVerify result: verify-no-match (done)\E/) {
+                    _log("child - Fprint failed - verify-no-match");
+                } elsif ($out =~ /failed to claim device: Device was already claimed/) {
+                    _log("child - Fprint - device already claimed");
+                    sleep 5;
+                } else {
+                    _log("child - Fprint did not verify\n".$out);
+                }
+                select undef, undef, undef, .1;
+                next;
+            }
+
+            _log("child - Fprint verify-match - Unlocking");
+            unlock();
+            sleep 2;
+        }
+    }
+}
