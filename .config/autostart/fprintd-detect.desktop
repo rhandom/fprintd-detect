@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories=System;
+Comment=
+Encoding=UTF-8
+Exec=/usr/bin/fprintd-detect -o ~/.fprintd-detect.log
+Hidden=true
+Icon=
+Name=Fprintd screensaver daemon
+Terminal=false
+Type=Application
